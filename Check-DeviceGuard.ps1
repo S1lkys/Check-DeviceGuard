@@ -1,6 +1,10 @@
 # Check-DeviceGuard.ps1
 # Kernel Security Posture & DSE Bypass Assessment
 
+param(
+    [string]$LolDriversJson
+)
+
 # --- Silent Data Collection ---
 $dg       = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard
 $dgReg    = "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard"
@@ -75,12 +79,6 @@ $biosVendor = (Get-CimInstance -Class Win32_BIOS -EA SilentlyContinue).Manufactu
 if ($csProduct -match "Virtual|VMware|VirtualBox|Xen|QEMU|HVM|KVM" -or $biosVendor -match "Hyper-V|VMware|innotek|Xen|QEMU|American Megatrends.*Virtual|KVM") {
     $isVM = $true
 }
-
-# --- WDAC Policy Detection ---
-$wdacPolicyPath = "C:\Windows\System32\CodeIntegrity\SIPolicy.p7b"
-$wdacMultiPath  = "C:\Windows\System32\CodeIntegrity\CiPolicies\Active"
-$wdacSingleExists = Test-Path $wdacPolicyPath
-$wdacMultiExists  = (Test-Path $wdacMultiPath) -and ((Get-ChildItem -Path $wdacMultiPath -Filter "*.cip" -EA SilentlyContinue | Measure-Object).Count -gt 0)
 
 # --- Helpers ---
 $W = { param($l,$v,$c) Write-Host ("    {0,-28} " -f $l) -NoNewline -ForegroundColor Gray; Write-Host $v -ForegroundColor $c }
@@ -347,26 +345,9 @@ if ($kmci -eq 2) {
     Note "WDAC bypass options:"
     Note "  1. Switch KMCI to audit mode (requires reboot, logs but does not block):"
     Cmd "Set-RuleOption -FilePath <policy.xml> -Option 3  (Audit Mode)"
-    Note "  2. If policy is unsigned: take ownership and remove the WDAC policy file"
-    if ($wdacSingleExists) {
-        Note "     SIPolicy.p7b detected at: $wdacPolicyPath"
-        Cmd "takeown /f `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`""
-        Cmd "icacls `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`" /grant administrators:F"
-        Cmd "Rename-Item `"C:\Windows\System32\CodeIntegrity\SIPolicy.p7b`" `"SIPolicy_1.old`""
-    } else {
-        Note "     SIPolicy.p7b NOT found at default location (single policy format)"
-    }
-    if ($wdacMultiExists) {
-        $cipFiles = Get-ChildItem -Path $wdacMultiPath -Filter "*.cip" -EA SilentlyContinue
-        Note "     Multiple policy format detected: $($cipFiles.Count) .cip file(s) in $wdacMultiPath"
-        foreach ($cip in $cipFiles) {
-            Note "       $($cip.Name)"
-        }
-        Cmd "takeown /f `"$wdacMultiPath\*.cip`""
-        Cmd "icacls `"$wdacMultiPath`" /grant administrators:F /T"
-        Cmd "Get-ChildItem `"$wdacMultiPath\*.cip`" | Rename-Item -NewName { `$_.Name -replace '\.cip$','.cip.old' }"
-    }
-    Note "     Reboot required after policy removal for change to take effect"
+    Note "  2. If policy is unsigned: delete the WDAC policy file and reboot"
+    Note "     Policy locations: C:\Windows\System32\CodeIntegrity\SIPolicy.p7b (single)"
+    Note "     or C:\Windows\System32\CodeIntegrity\CiPolicies\Active\{GUID}.cip (multiple)"
     Note "     Note: driversipolicy.p7b is the driver blocklist, NOT the WDAC KMCI policy"
     Note "  3. If policy is signed: only replaceable with a signed update policy"
     Note "  4. Use a driver that matches existing WDAC allow rules (signer-based)"
@@ -414,9 +395,6 @@ elseif (!$sb) {
         Note "g_CiOptions lives in VTL0 and BCD testsigning takes effect normally."
         Note "To fully unload the hypervisor (reduces overhead, cleans up):"
         Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f"
-        Cmd "bcdedit /set vsmlaunchtype off"
-        Cmd "bcdedit /set hypervisorlaunchtype off"
-        Note "Reboot required for hypervisor unload to take effect."
     }
 
     if ($gpoConflict) {
@@ -533,34 +511,23 @@ elseif ($sb -and $hvciOn -and !$hvciUefiLocked) {
     Write-Host "    ! Cannot load unsigned drivers or patch g_CiOptions with HVCI on." -ForegroundColor Yellow
 
     Write-Host ""
-    Write-Host "    Option B: Disable HVCI + VBS via registry and BCD (requires reboot)" -ForegroundColor Yellow
+    Write-Host "    Option B: Disable HVCI via registry (requires reboot)" -ForegroundColor Yellow
     Note "Without UEFI lock, HVCI enablement is controlled by a registry scenario key."
     Note "Disabling it and rebooting unloads the Secure Kernel, making g_CiOptions"
-    Note "in VTL0 the sole enforcer again. BCD entries ensure the hypervisor does not"
-    Note "start at all, preventing VBS from loading even if registry is partially reverted."
+    Note "in VTL0 the sole enforcer again."
     Write-Host ""
-    Step 1 "Disable HVCI and VBS via registry:"
-    Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity`" /v Enabled /t REG_DWORD /d 0 /f"
-    Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f"
-    Step 2 "Disable hypervisor and VSM launch via BCD:"
-    Cmd "bcdedit /set vsmlaunchtype off"
-    Cmd "bcdedit /set hypervisorlaunchtype off"
-    Note "vsmlaunchtype off prevents VSM (VTL1) from initializing at boot."
-    Note "hypervisorlaunchtype off prevents the Windows Hypervisor from loading entirely."
-    Note "Both are required for a clean VBS/HVCI disable when Secure Boot is on, because"
-    Note "Secure Boot protects BCD integrity and these are legitimate BCD options, not"
-    Note "blocked the way testsigning/nointegritychecks are."
+    Step 1 "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity`" /v Enabled /t REG_DWORD /d 0 /f"
     if ($gpoEnf) {
         Write-Host ""
         Write-Host "    * GPO will re-enable HVCI on refresh (~90min). Prevent this:" -ForegroundColor Yellow
-        Step 3 "sc stop gpsvc && sc config gpsvc start= disabled"
+        Step 2 "sc stop gpsvc && sc config gpsvc start= disabled"
         Note "Alternative: block SYSVOL access to prevent policy download:"
         Cmd "netsh advfirewall firewall add rule name=BlockSYSVOL dir=out action=block protocol=tcp remoteport=445"
-        Step 4 "shutdown /r /t 0"
-        Step 5 "After reboot: HVCI off, use BYOVD + g_CiOptions patch"
-    } else {
         Step 3 "shutdown /r /t 0"
         Step 4 "After reboot: HVCI off, use BYOVD + g_CiOptions patch"
+    } else {
+        Step 2 "shutdown /r /t 0"
+        Step 3 "After reboot: HVCI off, use BYOVD + g_CiOptions patch"
     }
 
     Write-Host ""
@@ -576,11 +543,9 @@ elseif ($sb -and $hvciOn -and !$hvciUefiLocked) {
     Step 4 "Reboot: system enters Safe Mode (hypervisor does not load)"
     Note "BitLocker TPM-only: Safe Mode may trigger recovery key prompt (PCR mismatch)"
     Note "BitLocker TPM+PIN: recovery key required (BCD change invalidates PCR seal)"
-    Step 5 "In Safe Mode (VBS/HVCI inactive): disable VBS and hypervisor launch"
+    Step 5 "In Safe Mode (VBS/HVCI inactive): disable VBS via registry"
     Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f"
     Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity`" /v Enabled /t REG_DWORD /d 0 /f"
-    Cmd "bcdedit /set vsmlaunchtype off"
-    Cmd "bcdedit /set hypervisorlaunchtype off"
     Step 6 "Remove Safe Mode boot and reboot normally:"
     Cmd "bcdedit /deletevalue {default} safeboot"
     Cmd "shutdown /r /t 0"
@@ -644,10 +609,6 @@ elseif ($sb -and $hvciOn -and $hvciUefiLocked) {
     Note "This is a one-shot bypass for the current Safe Mode session only."
     Note "Registry VBS disable has NO persistent effect here (UEFI lock overrides on"
     Note "normal boot). For persistent disable: firmware intervention (Option C)."
-    Note "Optional: set BCD to prevent hypervisor on subsequent normal boots (UEFI lock"
-    Note "may override, but BCD flags are an additional disable layer):"
-    Cmd "bcdedit /set vsmlaunchtype off"
-    Cmd "bcdedit /set hypervisorlaunchtype off"
     Step 6 "Remove Safe Mode boot:"
     Cmd "bcdedit /deletevalue {default} safeboot"
     Cmd "shutdown /r /t 0"
@@ -666,13 +627,7 @@ elseif ($sb -and $hvciOn -and $hvciUefiLocked) {
     Note "SecConfig.efi is a Microsoft tool that removes the UEFI lock variable."
     Note "Requires physical presence confirmation (press key at boot prompt)."
     Step 3 "Reboot into Windows, HVCI is now registry-disableable"
-    Step 4 "Disable VBS and hypervisor launch via registry and BCD:"
-    Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f"
-    Cmd "reg add `"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity`" /v Enabled /t REG_DWORD /d 0 /f"
-    Cmd "bcdedit /set vsmlaunchtype off"
-    Cmd "bcdedit /set hypervisorlaunchtype off"
-    Step 5 "shutdown /r /t 0"
-    Step 6 "After reboot: use BYOVD + g_CiOptions patch (SB+NoHV path)"
+    Step 4 "Use SB+HVCI or SB+NoHV attack paths"
 
     if ($isVM) {
         Write-Host ""
@@ -685,6 +640,86 @@ elseif ($sb -and $hvciOn -and $hvciUefiLocked) {
 }
 else {
     Write-Host "    ? Non-standard configuration. Review CONTROLS section." -ForegroundColor Gray
+}
+
+Write-Host ""
+Write-Host "  $([string]::new([char]0x2550, 76))" -ForegroundColor DarkCyan
+
+# ===================== VULNERABLE DRIVER SCAN =====================
+
+Write-Host ""
+Write-Host "  $([string]::new([char]0x2550, 76))" -ForegroundColor DarkCyan
+Write-Host "   VULNERABLE DRIVER SCAN" -ForegroundColor White
+Write-Host "  $([string]::new([char]0x2550, 76))" -ForegroundColor DarkCyan
+Write-Host ""
+
+$loldriversData = $null
+$lolSource = $null
+
+if ($LolDriversJson -and (Test-Path $LolDriversJson)) {
+    # Local JSON file provided via parameter
+    try {
+        $rawJson = Get-Content -Path $LolDriversJson -Raw -EA Stop
+        $loldriversData = $rawJson.Replace('"INIT"','"init"').Replace('"PAGE"','"page"') | ConvertFrom-Json
+        $lolSource = $LolDriversJson
+    } catch {
+        Write-Host "    [-] Failed to parse local JSON file: $LolDriversJson" -ForegroundColor Red
+        Write-Host "        Error: $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+} elseif ($LolDriversJson) {
+    Write-Host "    [-] Specified JSON file not found: $LolDriversJson" -ForegroundColor Red
+} else {
+    # Try fetching from loldrivers.io API
+    try {
+        $webClient = New-Object System.Net.WebClient
+        $rawJson = $webClient.DownloadString("https://www.loldrivers.io/api/drivers.json")
+        $loldriversData = $rawJson.Replace('"INIT"','"init"').Replace('"PAGE"','"page"') | ConvertFrom-Json
+        $lolSource = "https://www.loldrivers.io/api/drivers.json"
+    } catch {
+        Write-Host "    [-] Failed to reach https://www.loldrivers.io/api/drivers.json" -ForegroundColor Red
+        Write-Host "        Error: $($_.Exception.Message)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "    Use -LolDriversJson <path> to specify a local copy of drivers.json" -ForegroundColor Yellow
+        Write-Host ""
+    }
+}
+
+if ($loldriversData) {
+    $drivers = Get-ChildItem -Path "C:\Windows\System32\drivers" -EA SilentlyContinue
+    $driverNames = @{}
+    foreach ($d in $drivers) { $driverNames[$d.Name.ToLower()] = $d.FullName }
+
+    Write-Host "    Source:  $lolSource" -ForegroundColor DarkGray
+    Write-Host "    Scanned: $($drivers.Count) drivers in C:\Windows\System32\drivers" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $vulnCount = 0
+
+    foreach ($lol in $loldriversData.KnownVulnerableSamples) {
+        if (-not $lol.Filename) { continue }
+        $fname = $lol.Filename.ToLower()
+
+        if ($driverNames.ContainsKey($fname)) {
+            $driverPath = $driverNames[$fname]
+            $fileHash = (Get-FileHash -Path $driverPath -Algorithm SHA256 -EA SilentlyContinue).Hash
+
+            if ($fileHash -and $lol.SHA256 -and $fileHash -eq $lol.SHA256) {
+                Write-Host "    [!] VULNERABLE: " -NoNewline -ForegroundColor Red
+                Write-Host "$($lol.Filename)" -NoNewline -ForegroundColor White
+                Write-Host " (SHA256 match)" -ForegroundColor Red
+                Write-Host "        Path:   $driverPath" -ForegroundColor DarkGray
+                Write-Host "        SHA256: $fileHash" -ForegroundColor DarkGray
+                $vulnCount++
+            }
+        }
+    }
+
+    if ($vulnCount -eq 0) {
+        Write-Host "    [+] No known vulnerable drivers found on this system." -ForegroundColor Green
+    } else {
+        Write-Host ""
+        Write-Host "    Found $vulnCount vulnerable driver(s). Check https://www.loldrivers.io for exploitation details." -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""
